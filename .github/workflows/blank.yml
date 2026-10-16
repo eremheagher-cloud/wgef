@@ -1,0 +1,261 @@
+
+name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: 'Instance Number (1-10)'
+        required: true
+        default: '1'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: System Information
+        shell: powershell
+        run: |
+          Write-Host "=== PC VIRTUAL ===" -ForegroundColor Green
+          Write-Host "Instance: ${{ inputs.instance_number }}"
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores, NumberOfLogicalProcessors
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP configurado."
+
+      - name: Create User Account
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $userName = 'Rafael'
+          $passwordText = $env:RDP_PASSWORD
+
+          if ([string]::IsNullOrWhiteSpace($passwordText)) {
+            throw "Configure o secret RDP_PASSWORD no GitHub."
+          }
+
+          $securePassword = ConvertTo-SecureString `
+            $passwordText -AsPlainText -Force
+
+          $user = Get-LocalUser -Name $userName `
+            -ErrorAction SilentlyContinue
+
+          if ($user) {
+            Set-LocalUser -Name $userName -Password $securePassword
+          } else {
+            New-LocalUser -Name $userName `
+              -Password $securePassword `
+              -AccountNeverExpires
+          }
+
+          Add-LocalGroupMember -Group Administrators `
+            -Member $userName -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" `
+            -Member $userName -ErrorAction SilentlyContinue
+
+          Write-Host "Conta Rafael configurada."
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+
+      - name: Prepare Tailscale Dependencies
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          foreach ($serviceName in @(
+            'Dnscache',
+            'iphlpsvc',
+            'netprofm',
+            'WinHttpAutoProxySvc'
+          )) {
+            $service = Get-Service -Name $serviceName `
+              -ErrorAction SilentlyContinue
+
+            if ($service -and $service.Status -ne 'Running') {
+              if ($service.StartType -eq 'Disabled') {
+                Set-Service -Name $serviceName -StartupType Automatic
+              }
+
+              Start-Service -Name $serviceName `
+                -ErrorAction SilentlyContinue
+            }
+          }
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $installerPath = "$env:TEMP\tailscale-setup.exe"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup.exe"
+
+          Invoke-WebRequest -Uri $tsUrl `
+            -OutFile $installerPath -UseBasicParsing
+
+          $installProcess = Start-Process `
+            -FilePath $installerPath `
+            -ArgumentList '/quiet' `
+            -Wait -PassThru
+
+          Remove-Item $installerPath -Force `
+            -ErrorAction SilentlyContinue
+
+          if ($installProcess.ExitCode -ne 0) {
+            throw "Falha ao instalar o Tailscale."
+          }
+
+          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscaleExe)) {
+            throw "Executável do Tailscale não encontrado."
+          }
+
+          & $tailscaleExe version
+
+      - name: Start Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          Write-Host "=== STARTING TAILSCALE ===" -ForegroundColor Green
+
+          if (-not (Test-Path $tailscaleExe)) {
+            throw "Tailscale não está instalado."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "O secret TAILSCALE_AUTH_KEY não está configurado."
+          }
+
+          $service = Get-Service -Name Tailscale `
+            -ErrorAction SilentlyContinue
+
+          if (-not $service) {
+            throw "Serviço do Tailscale não encontrado."
+          }
+
+          if ($service.Status -ne 'Running') {
+            Start-Service -Name Tailscale
+            Start-Sleep -Seconds 5
+          }
+
+          & $tailscaleExe up `
+            "--authkey=$env:TAILSCALE_AUTH_KEY" `
+            "--hostname=pc-criado-alves7-pcm" `
+            "--accept-dns=false" `
+            "--timeout=120s"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "A autenticação falhou. Verifique se a Auth Key está válida, não expirou e pertence à sua rede Tailscale."
+          }
+
+          $tsIP = (& $tailscaleExe ip -4 |
+            Select-Object -First 1).ToString().Trim()
+
+          if ($tsIP -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
+            throw "Não foi possível obter o IP do Tailscale."
+          }
+
+          "TAILSCALE_IP=$tsIP" |
+            Out-File -FilePath $env:GITHUB_ENV -Append
+
+          Write-Host "Tailscale conectado: $tsIP" -ForegroundColor Green
+
+      - name: Install Google Chrome
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installerPath = "$env:TEMP\chrome_installer.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://dl.google.com/chrome/install/latest/chrome_installer.exe" `
+            -OutFile $installerPath -UseBasicParsing
+
+          $p = Start-Process -FilePath $installerPath `
+            -ArgumentList '/silent', '/install' `
+            -Wait -PassThru
+
+          Remove-Item $installerPath -Force `
+            -ErrorAction SilentlyContinue
+
+          if ($p.ExitCode -ne 0) {
+            Write-Warning "A instalação do Chrome falhou."
+          }
+
+      - name: Connection Details
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          Write-Host "=== RDP CONNECTION DETAILS ===" -ForegroundColor Green
+          Write-Host "Host: $env:TAILSCALE_IP"
+          Write-Host "Username: Rafael"
+          Write-Host "Password: definida no secret RDP_PASSWORD"
+          Write-Host "Instale o Tailscale no dispositivo cliente e conecte-o à mesma rede."
+
+      - name: Keep Session Alive
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $tailscaleExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $counter = 0
+
+          while ($true) {
+            $counter++
+            Write-Host "Verificação #$counter - $(Get-Date)"
+
+            $tsIP = (& $tailscaleExe ip -4 2>$null |
+              Select-Object -First 1)
+
+            if ($tsIP -notmatch '^\d{1,3}(\.\d{1,3}){3}$') {
+              Write-Warning "Tailscale desconectado. Tentando reconectar."
+
+              & $tailscaleExe up `
+                "--authkey=$env:TAILSCALE_AUTH_KEY" `
+                "--hostname=pc-criado-alves7-pcm" `
+                "--accept-dns=false" `
+                "--timeout=120s"
+
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Reconexão falhou; nova tentativa em 60 segundos."
+              }
+            } else {
+              Write-Host "Tailscale IP: $tsIP"
+            }
+
+            Start-Sleep -Seconds 60
+          }
+          
